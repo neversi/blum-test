@@ -1,0 +1,14 @@
+version: '3.8'
+services:
+  postgres:
+    image: postgres
+    container_name: rate-calculator-postgres
+    restart: always
+    environment:
+      POSTGRES_DB: calculator
+      POSTGRES_USER: default
+      POSTGRES_PASSWORD: default
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./postgres_data:/var/lib/postgresql/data
