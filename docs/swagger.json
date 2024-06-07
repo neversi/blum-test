@@ -1,0 +1,99 @@
+{
+    "swagger": "2.0",
+    "info": {
+        "description": "Currencies rate calculator API with convertion functionality.",
+        "title": "Rate Calculator API",
+        "termsOfService": "http://swagger.io/terms/",
+        "contact": {
+            "name": "Abdarrakhman Akhmetgali",
+            "email": "neversi123123@gmail.com"
+        },
+        "version": "0.1"
+    },
+    "basePath": "/v0",
+    "paths": {
+        "/convert": {
+            "get": {
+                "description": "Converts Fiat/Crypto and Crypto/Fiat currency pairs",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "rates"
+                ],
+                "summary": "Converts amount of base currency to quote currency",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "base currency code",
+                        "name": "base",
+                        "in": "query",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "quote currency code",
+                        "name": "quote",
+                        "in": "query",
+                        "required": true
+                    },
+                    {
+                        "type": "number",
+                        "description": "input amount of base currency",
+                        "name": "amount",
+                        "in": "query",
+                        "required": true
+                    },
+                    {
+                        "type": "integer",
+                        "default": 5,
+                        "description": "round up to decimals places",
+                        "name": "decimals",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/http.ConvertResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "invalid parameters",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
+                    },
+                    "422": {
+                        "description": "currency or rate not exists",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": ""
+                    }
+                }
+            }
+        }
+    },
+    "definitions": {
+        "http.ConvertResponse": {
+            "type": "object",
+            "properties": {
+                "output": {
+                    "type": "number"
+                }
+            }
+        },
+        "http.ErrorResponse": {
+            "type": "object",
+            "properties": {
+                "error": {
+                    "type": "string"
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,66 @@
+basePath: /v0
+definitions:
+  http.ConvertResponse:
+    properties:
+      output:
+        type: number
+    type: object
+  http.ErrorResponse:
+    properties:
+      error:
+        type: string
+    type: object
+info:
+  contact:
+    email: neversi123123@gmail.com
+    name: Abdarrakhman Akhmetgali
+  description: Currencies rate calculator API with convertion functionality.
+  termsOfService: http://swagger.io/terms/
+  title: Rate Calculator API
+  version: "0.1"
+paths:
+  /convert:
+    get:
+      description: Converts Fiat/Crypto and Crypto/Fiat currency pairs
+      parameters:
+      - description: base currency code
+        in: query
+        name: base
+        required: true
+        type: string
+      - description: quote currency code
+        in: query
+        name: quote
+        required: true
+        type: string
+      - description: input amount of base currency
+        in: query
+        name: amount
+        required: true
+        type: number
+      - default: 5
+        description: round up to decimals places
+        in: query
+        name: decimals
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/http.ConvertResponse'
+        "400":
+          description: invalid parameters
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+        "422":
+          description: currency or rate not exists
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+        "500":
+          description: ""
+      summary: Converts amount of base currency to quote currency
+      tags:
+      - rates
+swagger: "2.0"

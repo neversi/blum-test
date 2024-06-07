@@ -3,30 +3,46 @@ package service
 import (
 	"blum-test/common/config"
 	"blum-test/common/logger"
-	"blum-test/common/models"
+	. "blum-test/common/models"
+	"blum-test/common/utils"
 	"blum-test/internal/clients/fastforex"
 	"blum-test/internal/repository"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/big"
 	"strings"
-	"sync"
 	"sync/atomic"
+
+	"github.com/shopspring/decimal"
 
 	"golang.org/x/sync/errgroup"
 )
 
+// RateCalculator stores and updates data about currency pairs' rates
+// in order to maintain data relevance. Also can make convertations
+// between two currencies through USD cross-rates.
 type RateCalculator struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+
 	config.Service
-	isStarted int32
+	isRunning int32
 
-	currenciesMu sync.RWMutex
-	currencies   map[models.CurrencyCode]models.Currency
-
-	ratesMu    sync.RWMutex
-	ratesToUSD map[models.CurrencyCode]*big.Float
+	// currencies is the map which under the hoods use sync.Map
+	// the reason why sync.Map is better (imho) than other
+	// primitive synchronization methods is that in highly
+	// concurrent (huge DAU/high RPS) environment
+	// mechanisms like mutexescould delay data relevance because
+	// of high amount of read operations while sync.Map by
+	// distributing values by shards provides more sofisticated
+	// writes operation which is not blocked by highly read operations
+	//
+	// also mutex synchronization could be used too, though it
+	// could lead to some delayed rates updates, due to its nature
+	currencies utils.MapThSf[CurrencyCode, Currency]
+	// same logic applied here
+	ratesInUSD utils.MapThSf[CurrencyCode, decimal.Decimal]
 
 	repo   repository.ICurrencyRepository
 	client *fastforex.Client
@@ -34,38 +50,46 @@ type RateCalculator struct {
 
 var log = logger.JSONLogger.With(slog.String("service", "rate_calculator"))
 
-func NewRateCalculator(cfg *config.Service, repo repository.ICurrencyRepository, client *fastforex.Client) *RateCalculator {
+func NewRateCalculator(
+	cfg *config.Service,
+	repo repository.ICurrencyRepository,
+	client *fastforex.Client,
+) *RateCalculator {
 	return &RateCalculator{
-		Service:    *cfg,
-		currencies: make(map[models.CurrencyCode]models.Currency),
-		ratesToUSD: make(map[models.CurrencyCode]*big.Float),
+		Service: *cfg,
 
 		repo:   repo,
 		client: client,
 	}
 }
 
-func (c *RateCalculator) getIsStarted() bool {
-	val := atomic.LoadInt32(&c.isStarted)
+func (c *RateCalculator) getIsRunning() bool {
+	val := atomic.LoadInt32(&c.isRunning)
 	if val == 0 {
 		return false
 	}
 	return true
 }
 
-func (c *RateCalculator) setIsStarted(to bool) {
+func (c *RateCalculator) setIsRunning(to bool) {
 	if to {
-		atomic.StoreInt32(&c.isStarted, 1)
+		atomic.StoreInt32(&c.isRunning, 1)
 	}
-	atomic.StoreInt32(&c.isStarted, 0)
+	atomic.StoreInt32(&c.isRunning, 0)
 }
 
-func (c *RateCalculator) Start(ctx context.Context) error {
-	if c.getIsStarted() {
+func (c *RateCalculator) Start() error {
+	if c.getIsRunning() {
 		return ErrServiceStarted
 	}
-	c.setIsStarted(true)
-	defer c.setIsStarted(false)
+	c.setIsRunning(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c.ctx = ctx
+	c.cancel = cancel
+
+	defer c.setIsRunning(false)
 
 	log.Info("starting service...")
 
@@ -73,15 +97,22 @@ func (c *RateCalculator) Start(ctx context.Context) error {
 
 	log.Debug("starting polling currencies...")
 	workerGroup.Go(func() error {
-		return c.pollCurrencyUpdates(ctxEG)
+		return c.listenCurrencyUpdates(ctxEG)
 	})
 
 	log.Debug("getting initial currencies and rates")
-	if err := c.fetchAndUpdateCurrencies(ctx); err != nil {
+	if err := c.fetchEnabledCurrencies(ctx); err != nil {
 		return err
 	}
 
-	if err := c.fetchAndUpdateRates(ctx); err != nil {
+	currencies := make(map[CurrencyCode]Currency)
+
+	c.currencies.Range(func(key CurrencyCode, value Currency) bool {
+		currencies[key] = value
+		return true
+	})
+
+	if err := c.fetchRates(ctx, currencies); err != nil {
 		return err
 	}
 
@@ -97,11 +128,21 @@ func (c *RateCalculator) Start(ctx context.Context) error {
 	return nil
 }
 
+func (c *RateCalculator) Stop() {
+	if c.cancel != nil {
+		c.cancel()
+		c.cancel = nil
+	}
+}
+
 func (c *RateCalculator) Convert(
 	ctx context.Context,
 	base, quote string,
 	amount float64,
+	decimals int64,
 ) (res float64, err error) {
+	base = strings.ToUpper(base)
+	quote = strings.ToUpper(quote)
 	defer func() {
 		if r := recover(); r != nil {
 			log.Error("panic while converting", r)
@@ -117,7 +158,7 @@ func (c *RateCalculator) Convert(
 		return 0, err
 	}
 
-	pair := models.CurrencyPair{
+	pair := CurrencyPair{
 		Base:  *baseCurrency,
 		Quote: *quoteCurrency,
 	}
@@ -126,96 +167,141 @@ func (c *RateCalculator) Convert(
 		return 0, err
 	}
 
-	baseUsdRate, quoteUsdRate := c.getRate(base, quote)
-	if baseUsdRate.Cmp(big.NewFloat(0)) == 0 {
+	baseUsdRate, ok := c.ratesInUSD.Load(CurrencyCode(base))
+	if !ok || baseUsdRate.Cmp(decimal.Zero) == 0 {
 		log.Error("zero denominator", slog.Any("currency_code", baseCurrency.Code))
 		return 0, ErrInvalidInternalRate
 	}
 
-	crossRate := new(big.Float).Quo(quoteUsdRate, baseUsdRate)
+	quoteUsdRate, ok := c.ratesInUSD.Load(CurrencyCode(quote))
+	if !ok {
+		return 0, ErrInvalidInternalRate
+	}
 
-	res, _ = crossRate.Float64()
+	fmt.Println(baseUsdRate, quoteUsdRate)
+
+	crossRate := quoteUsdRate.Div(baseUsdRate)
+
+	convertAmount := crossRate.Mul(decimal.NewFromFloat(amount))
+
+	res, _ = convertAmount.Round(int32(decimals)).Float64()
 
 	return res, nil
 }
 
-func (c *RateCalculator) updateCurrencies(currencies []models.Currency) {
-	c.currenciesMu.Lock()
-	defer c.currenciesMu.Unlock()
-
+func (c *RateCalculator) updateCurrencies(currencies []Currency) {
 	for _, currency := range currencies {
-		c.currencies[currency.Code] = currency
+		if currency.IsEnabled {
+			c.currencies.Store(currency.Code, currency)
+		} else {
+			c.currencies.Delete(currency.Code)
+		}
 	}
 }
 
-func (c *RateCalculator) getCurrency(code string) (*models.Currency, error) {
+func (c *RateCalculator) getCurrency(code string) (*Currency, error) {
 	code = strings.ToUpper(code)
 
-	c.currenciesMu.RLock()
-	defer c.currenciesMu.RUnlock()
-
-	currency, ok := c.currencies[models.CurrencyCode(code)]
+	currency, ok := c.currencies.Load(CurrencyCode(code))
 	if !ok {
-		return nil, &models.ErrCurrencyNotAvailable{
-			Code: models.CurrencyCode(code),
+		return nil, &ErrCurrencyNotAvailable{
+			Code: CurrencyCode(code),
 		}
 	}
 
 	return &currency, nil
 }
 
-func (c *RateCalculator) getRate(base, quote string) (*big.Float, *big.Float) {
-	base = strings.ToUpper(base)
-	quote = strings.ToUpper(quote)
-
-	c.ratesMu.RLock()
-	defer c.ratesMu.RUnlock()
-
-	return c.ratesToUSD[models.CurrencyCode(base)], c.ratesToUSD[models.CurrencyCode(quote)]
-}
-
-func (c *RateCalculator) updateRates(ratesUSD map[string]float64) {
-	c.ratesMu.Lock()
-	defer c.ratesMu.Unlock()
-
-	for code, rateUSD := range ratesUSD {
-		c.ratesToUSD[models.CurrencyCode(code)] = big.NewFloat(rateUSD)
-	}
-}
-
-func (c *RateCalculator) fetchAndUpdateRates(ctx context.Context) error {
-	quotes := []string{}
-
-	c.currenciesMu.RLock()
-	for code := range c.currencies {
-		quotes = append(quotes, string(code))
-	}
-	c.currenciesMu.RUnlock()
-
-	ratesUSD, err := c.client.GetRatesByUSD(ctx, quotes)
+func (c *RateCalculator) fetchUsdtUsdRate(ctx context.Context) (float64, error) {
+	usdtUsdRates, err := c.client.GetCryptoRates(
+		ctx,
+		[]CurrencyCode{USDT},
+		USD,
+	)
 	if err != nil {
-		return fmt.Errorf("error while fetching rates: %w", err)
+		return 0, fmt.Errorf("GetCryptoRates(): %w", err)
 	}
 
-	ratesFloat := map[string]float64{}
-	for code, rateUSD := range ratesUSD {
+	usdtUsdRate, err := usdtUsdRates.Rates[USDT].Float64()
+	if err != nil {
+		log.Error(
+			"invalid USDT/USD rate",
+			slog.String("actual_value", usdtUsdRates.Rates[USDT].String()),
+			slog.Any("error", err),
+		)
+		return 0, fmt.Errorf("invalid USDT/USD rate: %w", err)
+	}
+
+	return usdtUsdRate, nil
+}
+
+func (c *RateCalculator) fetchRates(
+	ctx context.Context,
+	currencies map[CurrencyCode]Currency,
+) error {
+	fiatCodes := []CurrencyCode{}
+	cryptoCodes := []CurrencyCode{}
+
+	for code, val := range currencies {
+		switch val.Type {
+		case Crypto:
+			cryptoCodes = append(cryptoCodes, code)
+		case Fiat:
+			fiatCodes = append(fiatCodes, code)
+		}
+	}
+
+	usdtUsdRate, err := c.fetchUsdtUsdRate(ctx)
+	if err != nil {
+		return fmt.Errorf("getUsdtUsdRate(): %w", err)
+	}
+	_ = usdtUsdRate
+
+	fiatRates, err := c.client.GetFiatRates(ctx, USD, fiatCodes)
+	if err != nil {
+		return fmt.Errorf("GetFiatRates(): %w", err)
+	}
+
+	cryptoRates, err := c.client.GetCryptoRates(ctx, cryptoCodes, USDT)
+	if err != nil {
+		return fmt.Errorf("GetCryptoRates(): %w", err)
+	}
+
+	ratesFloat := map[CurrencyCode]float64{}
+	for code, rateUSD := range fiatRates.Rates {
 		rateFloat, err := rateUSD.Float64()
 		if err != nil {
 			log.Error("invalid rate", slog.String("actual_value", rateUSD.String()), err)
 			return fmt.Errorf("invalid rate from response: %w", err)
 		}
-		ratesFloat[code] = rateFloat
+
+		ratesFloat[CurrencyCode(code)] = rateFloat
 	}
 
-	c.updateRates(ratesFloat)
+	for code, rateUSD := range cryptoRates.Rates {
+		rateFloat, err := rateUSD.Float64()
+		if err != nil {
+			log.Error("invalid rate", slog.String("actual_value", rateUSD.String()), err)
+			return fmt.Errorf("invalid rate from response: %w", err)
+		}
+
+		ratesFloat[code] = 1 / (rateFloat) * usdtUsdRate
+	}
+
+	ratesFloat[USDT] = usdtUsdRate
+	fmt.Println(ratesFloat)
+
+	for code, rateUSD := range ratesFloat {
+		c.ratesInUSD.Store(code, decimal.NewFromFloat(rateUSD))
+	}
 
 	return nil
 }
 
-func (c *RateCalculator) fetchAndUpdateCurrencies(ctx context.Context) error {
+func (c *RateCalculator) fetchEnabledCurrencies(ctx context.Context) error {
 	currencies, err := c.repo.ListEnabledCurrencies(ctx)
 	if err != nil {
-		return fmt.Errorf("error while fetching from db: %w", err)
+		return fmt.Errorf("ListEnabledCurrencies(): %w", err)
 	}
 
 	c.updateCurrencies(currencies)

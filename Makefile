@@ -7,11 +7,11 @@ NAME := exchange-rate-calculator
 
 .PHONY: build
 build:
-	go build -race -mod=vendor -o "$(NAME)"
+	go build -race -mod=vendor -o "$(NAME)" cmd/$(NAME)/main.go
 
 .PHONY: run
 run:
-	go run cmd/main.go
+	go run cmd/$(NAME)/main.go
 
 .PHONY: local-test
 local-test:
@@ -35,4 +35,8 @@ fmt:
 
 .PHONY: swag
 swag:
-	swag init
+	swag init -g cmd/$(NAME)/main.go -d ./
+
+.PHONY: swag-fmt
+swag-fmt:
+	swag fmt -d ./cmd/$(NAME)/,./

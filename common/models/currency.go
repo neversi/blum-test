@@ -1,7 +1,7 @@
 package models
 
 import (
-	"fmt"
+	"encoding/json"
 	"time"
 )
 
@@ -17,6 +17,11 @@ const (
 	// Gold CurrencyType = "GOLD"
 )
 
+const (
+	USD  CurrencyCode = "USD"
+	USDT CurrencyCode = "USDT"
+)
+
 type Currency struct {
 	Name      string
 	Code      CurrencyCode
@@ -25,34 +30,13 @@ type Currency struct {
 	UpdatedAt time.Time
 }
 
-type CurrencyPair struct {
-	Base  Currency
-	Quote Currency
-}
-
-func (i CurrencyPair) Validate() error {
-	if !i.Base.IsEnabled {
-		return &ErrCurrencyNotAvailable{
-			Code: i.Base.Code,
-		}
+func (c *CurrencyCode) UnmarshalJSON(data []byte) error {
+	var res string
+	if err := json.Unmarshal(data, &res); err != nil {
+		return err
 	}
 
-	if !i.Quote.IsEnabled {
-		return &ErrCurrencyNotAvailable{
-			Code: i.Quote.Code,
-		}
-	}
-
-	if i.Base.Type == i.Quote.Type {
-		return &ErrInvalidCurrencyPair{
-			Base:  &i.Base,
-			Quote: &i.Quote,
-		}
-	}
+	*c = CurrencyCode(res)
 
 	return nil
-}
-
-func (i CurrencyPair) String() string {
-	return fmt.Sprintf("%s/%s", i.Base.Code, i.Quote.Code)
 }
