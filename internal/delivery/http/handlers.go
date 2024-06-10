@@ -4,7 +4,6 @@ import (
 	"blum-test/common/models"
 	"blum-test/internal/service"
 	"errors"
-	"fmt"
 	"net/http"
 	"strconv"
 
@@ -59,7 +58,6 @@ func (s *Server) Convert(c *fiber.Ctx) error {
 			})
 		}
 	}
-	fmt.Println(decimalsStr, decimals)
 
 	res, err := s.svc.Convert(c.Context(), base, quote, amount, decimals)
 	if err != nil {

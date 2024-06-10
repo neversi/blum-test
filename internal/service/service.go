@@ -178,8 +178,6 @@ func (c *RateCalculator) Convert(
 		return 0, ErrInvalidInternalRate
 	}
 
-	fmt.Println(baseUsdRate, quoteUsdRate)
-
 	crossRate := quoteUsdRate.Div(baseUsdRate)
 
 	convertAmount := crossRate.Mul(decimal.NewFromFloat(amount))
@@ -289,7 +287,6 @@ func (c *RateCalculator) fetchRates(
 	}
 
 	ratesFloat[USDT] = usdtUsdRate
-	fmt.Println(ratesFloat)
 
 	for code, rateUSD := range ratesFloat {
 		c.ratesInUSD.Store(code, decimal.NewFromFloat(rateUSD))
